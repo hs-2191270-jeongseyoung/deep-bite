@@ -49,7 +49,14 @@ uvicorn main:app --reload
 
 ```
 
-실행 후 브라우저에서 `http://127.0.0.1:8000`으로 접속합니다.
+### 4. 로컬 서버 연결 (추가 터미널로 실행)
+
+```
+ngrok http --domain=endpoint-semifinal-lasso.ngrok-free.dev 8000
+
+```
+실행 후 브라우저에서 https://endpoint-semifinal-lasso.ngrok-free.dev/ 으로 접속합니다.
+
 
 ## 📊 데이터 출처 및 라이선스 (Data Citation & License)
 
