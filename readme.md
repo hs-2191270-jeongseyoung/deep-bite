@@ -38,7 +38,7 @@ source venv/bin/activate
 ### 2. 필수 라이브러리 설치
 
 ```
-pip install fastapi uvicorn pandas torch pyproj
+pip install fastapi uvicorn pandas torch pyproj uvicorn fastapi[standard]
 
 ```
 
