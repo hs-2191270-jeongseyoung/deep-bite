@@ -2,41 +2,51 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 import pandas as pd
 import numpy as np
-import torch
-import torch.nn as nn
 import os
 import math
 from pyproj import Transformer
-from datetime import datetime
+
+from deepbite_bidirectional_ai import DeepBiteRecommender, train_bidirectional_model
+from ai_router import router as ai_suitability_router
 
 app = FastAPI()
+app.include_router(ai_suitability_router)
 
 # ---------------------------------------------------------
-# 1. PyTorch AI 모델 정의
+# 1. 학습된 양방향 PyTorch AI 상권 적합도 모델 로드
+#    (서울시 425개 행정동 14,626개 시계열 학습 + 성북구 2026Q2 검증 + 구글 리뷰 결합)
 # ---------------------------------------------------------
-class MarketEvaluationModel(nn.Module):
-    def __init__(self):
-        super(MarketEvaluationModel, self).__init__()
-        self.fc1 = nn.Linear(3, 16)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(16, 8)
-        self.fc3 = nn.Linear(8, 1)
-        self.sigmoid = nn.Sigmoid()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FEATURES_CSV = os.path.join(BASE_DIR, "seongbuk_training_features.csv")
+if not os.path.exists(FEATURES_CSV):
+    FEATURES_CSV = os.path.join(BASE_DIR, "data", "seongbuk_training_features.csv")
 
-    def forward(self, x):
-        out = self.fc1(x)
-        out = self.relu(out)
-        out = self.fc2(out)
-        out = self.relu(out)
-        out = self.fc3(out)
-        out = self.sigmoid(out)
-        return out
+TIMESERIES_CSV = os.path.join(BASE_DIR, "seoul_timeseries_training.csv")
+if not os.path.exists(TIMESERIES_CSV):
+    TIMESERIES_CSV = os.path.join(BASE_DIR, "data", "seoul_timeseries_training.csv")
 
-ai_model = MarketEvaluationModel()
-ai_model.eval()
+_recommender = None
+
+
+def get_ai_recommender() -> DeepBiteRecommender:
+    global _recommender
+    if _recommender is None:
+        artifacts = train_bidirectional_model(
+            features_csv_path=FEATURES_CSV,
+            timeseries_csv_path=TIMESERIES_CSV,
+            model_save_dir=os.path.join(BASE_DIR, "models"),
+            epochs=80,
+            lr=0.005,
+        )
+        _recommender = DeepBiteRecommender(
+            features_csv_path=FEATURES_CSV,
+            artifacts=artifacts,
+        )
+    return _recommender
+
 
 # ---------------------------------------------------------
-# 2. 공공데이터 로드 및 전처리 파이프라인
+# 2. 공공데이터 로드 및 전처리 파이프라인 (기존 인허가 데이터 유지)
 # ---------------------------------------------------------
 DATA_FILE = "data/seongbuk_market.csv"
 transformer = Transformer.from_crs("epsg:5181", "epsg:4326", always_xy=True)
@@ -57,6 +67,7 @@ COORDINATES = {
 
 cached_df = None
 
+
 def load_and_preprocess_data():
     global cached_df
     if cached_df is not None:
@@ -64,30 +75,30 @@ def load_and_preprocess_data():
 
     if not os.path.exists(DATA_FILE):
         return pd.DataFrame()
-    
+
     try:
-        df = pd.read_csv(DATA_FILE, encoding='cp949', low_memory=False)
+        df = pd.read_csv(DATA_FILE, encoding="cp949", low_memory=False)
     except UnicodeDecodeError:
-        df = pd.read_csv(DATA_FILE, encoding='utf-8', low_memory=False)
+        df = pd.read_csv(DATA_FILE, encoding="utf-8", low_memory=False)
     except Exception:
         return pd.DataFrame()
 
-    valid_coords = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)']).copy()
-    
+    valid_coords = df.dropna(subset=["좌표정보(X)", "좌표정보(Y)"]).copy()
+
     def convert_coords(row):
         try:
-            x, y = float(row['좌표정보(X)']), float(row['좌표정보(Y)'])
+            x, y = float(row["좌표정보(X)"]), float(row["좌표정보(Y)"])
             lon, lat = transformer.transform(x, y)
             return pd.Series([lat, lon])
-        except:
+        except Exception:
             return pd.Series([None, None])
 
-    valid_coords[['lat', 'lng']] = valid_coords.apply(convert_coords, axis=1)
-    df_processed = valid_coords.dropna(subset=['lat', 'lng']).copy()
+    valid_coords[["lat", "lng"]] = valid_coords.apply(convert_coords, axis=1)
+    df_processed = valid_coords.dropna(subset=["lat", "lng"]).copy()
 
-    # 법정동 파싱 함수
     def extract_dong(addr):
-        if pd.isna(addr): return "기타"
+        if pd.isna(addr):
+            return "기타"
         parts = str(addr).split()
         if len(parts) > 2:
             dong = parts[2]
@@ -96,39 +107,40 @@ def load_and_preprocess_data():
                     return key
         return "기타"
 
-    df_processed['법정동'] = df_processed['지번주소'].apply(extract_dong)
+    df_processed["법정동"] = df_processed["지번주소"].apply(extract_dong)
 
-    # 날짜 파싱 및 영업 유지 기간(Lifespan) 계산
-    df_processed['인허가일자_dt'] = pd.to_datetime(df_processed['인허가일자'], errors='coerce')
-    df_processed['폐업일자_dt'] = pd.to_datetime(df_processed['폐업일자'], errors='coerce')
-    
-    current_date = pd.to_datetime('2026-10-28')
+    df_processed["인허가일자_dt"] = pd.to_datetime(df_processed["인허가일자"], errors="coerce")
+    df_processed["폐업일자_dt"] = pd.to_datetime(df_processed["폐업일자"], errors="coerce")
+
+    current_date = pd.to_datetime("2026-10-28")
 
     def calc_lifespan(row):
-        if pd.notnull(row['폐업일자_dt']):
-            delta = row['폐업일자_dt'] - row['인허가일자_dt']
+        if pd.notnull(row["폐업일자_dt"]):
+            delta = row["폐업일자_dt"] - row["인허가일자_dt"]
         else:
-            delta = current_date - row['인허가일자_dt']
+            delta = current_date - row["인허가일자_dt"]
         return max(delta.days, 0) / 365.25
 
-    df_processed['영업유지기간_년'] = df_processed.apply(calc_lifespan, axis=1)
-    df_processed['개업년도'] = df_processed['인허가일자_dt'].dt.year.fillna(0).astype(int)
-    df_processed['폐업년도'] = df_processed['폐업일자_dt'].dt.year.fillna(0).astype(int)
+    df_processed["영업유지기간_년"] = df_processed.apply(calc_lifespan, axis=1)
+    df_processed["개업년도"] = df_processed["인허가일자_dt"].dt.year.fillna(0).astype(int)
+    df_processed["폐업년도"] = df_processed["폐업일자_dt"].dt.year.fillna(0).astype(int)
 
     cached_df = df_processed
     return cached_df
+
 
 def haversine_distance(lat1, lon1, lat2, lon2):
     R = 6371000
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     delta_phi = math.radians(lat2 - lat1)
     delta_lambda = math.radians(lon2 - lon1)
-    a = math.sin(delta_phi / 2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2)**2
+    a = math.sin(delta_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
+
 # ---------------------------------------------------------
-# 3. API 엔드포인트 1: 반경 미세 상권 분석
+# 3. API 엔드포인트 1: 반경 미세 상권 분석 (실제 학습된 PyTorch AI 연동)
 # ---------------------------------------------------------
 @app.get("/api/radius-analysis")
 def analyze_radius(lat: float, lng: float, radius_m: float = 300.0):
@@ -136,67 +148,57 @@ def analyze_radius(lat: float, lng: float, radius_m: float = 300.0):
     if df.empty:
         raise HTTPException(status_code=500, detail="데이터 로드 실패")
 
-    df['distance'] = df.apply(lambda r: haversine_distance(lat, lng, r['lat'], r['lng']), axis=1)
-    nearby_df = df[df['distance'] <= radius_m]
+    df["distance"] = df.apply(lambda r: haversine_distance(lat, lng, r["lat"], r["lng"]), axis=1)
+    nearby_df = df[df["distance"] <= radius_m]
 
-    total_count = len(nearby_df)
-    active_df = nearby_df[nearby_df['상세영업상태명'] == '영업']
-    closed_df = nearby_df[nearby_df['상세영업상태명'] == '폐업']
+    active_df = nearby_df[nearby_df["상세영업상태명"] == "영업"]
+    closed_df = nearby_df[nearby_df["상세영업상태명"] == "폐업"]
     active_count = len(active_df)
     closed_count = len(closed_df)
 
-    avg_active_lifespan = round(active_df['영업유지기간_년'].mean(), 1) if not active_df.empty else 0.0
-    avg_closed_lifespan = round(closed_df['영업유지기간_년'].mean(), 1) if not closed_df.empty else 0.0
+    avg_active_lifespan = round(active_df["영업유지기간_년"].mean(), 1) if not active_df.empty else 0.0
+    avg_closed_lifespan = round(closed_df["영업유지기간_년"].mean(), 1) if not closed_df.empty else 0.0
 
     recent_years = [2022, 2023, 2024, 2025, 2026]
     yearly_trend = {}
     for y in recent_years:
-        op_cnt = len(nearby_df[nearby_df['개업년도'] == y])
-        cl_cnt = len(nearby_df[nearby_df['폐업년도'] == y])
+        op_cnt = len(nearby_df[nearby_df["개업년도"] == y])
+        cl_cnt = len(nearby_df[nearby_df["폐업년도"] == y])
         yearly_trend[str(y)] = {"open": op_cnt, "close": cl_cnt}
 
-    if not nearby_df.empty:
-        industry_stats = nearby_df.groupby('업태구분명')['상세영업상태명'].agg(
-            total='count',
-            active=lambda x: (x == '영업').sum()
-        )
-        industry_stats['survival_rate'] = industry_stats['active'] / industry_stats['total']
-        top_categories = active_df['업태구분명'].value_counts().head(3).to_dict()
-        
-        valid_ind = industry_stats[industry_stats['total'] >= 2]
-        if not valid_ind.empty:
-            best_row = valid_ind.sort_values(by=['survival_rate', 'active'], ascending=False).iloc[0]
-            recommended_industry = best_row.name
-            survival_pct = round(best_row['survival_rate'] * 100, 1)
-            industry_reason = f"반경 내 생존율 **{survival_pct}%** (평균 운영 {avg_active_lifespan}년)를 기록하며 과당경쟁을 피한 최적 업종입니다."
-        else:
-            recommended_industry = "카페"
-            survival_pct = 50.0
-            industry_reason = "신규 틈새시장 진입이 유리합니다."
-    else:
-        top_categories = {"데이터 없음": 0}
-        recommended_industry = "한식/카페"
-        survival_pct = 0.0
-        industry_reason = "반경 내 점포가 없어 상권 개척이 필요합니다."
+    top_categories = (
+        active_df["업태구분명"].value_counts().head(3).to_dict()
+        if not active_df.empty
+        else {"데이터 없음": 0}
+    )
 
-    active_tensor_val = active_count / 100.0
-    closed_ratio = (closed_count / total_count) if total_count > 0 else 0.5
-    diversity = (survival_pct / 100.0)
+    # 학습된 양방향 PyTorch AI 모델로 클릭 좌표 권역의 최적 업종 및 적합도 산출
+    rec = get_ai_recommender()
+    ai_top = rec.recommend_categories_for_region(lat=lat, lng=lng, top_k=1)[0]
+    recommended_industry = ai_top["추천_업종"]
+    ai_score = round(float(ai_top["AI_상권적합도_점수"]), 1)
+    pred_sales = ai_top["AI_예측_차기분기_점포당매출_만원"]
+    pred_surv = ai_top["AI_예측_생존율_퍼센트"]
+    avg_rating = ai_top["평균_신뢰도평점"]
+    region_name = ai_top["권역"]
 
-    input_tensor = torch.tensor([[active_tensor_val, closed_ratio, diversity]], dtype=torch.float32)
-    with torch.no_grad():
-        ai_raw_score = ai_model(input_tensor).item()
-    ai_score = round(ai_raw_score * 100, 1)
-
-    recommendation = f"🤖 [시계열 및 생존력 분석] 추천 업종: {recommended_industry} (적합도 {ai_score}점)"
+    industry_reason = (
+        f"[{region_name} AI 예측] 차기 분기 예상 점포당 매출 <b>{pred_sales:,.0f}만 원</b> · "
+        f"예상 생존율 <b>{pred_surv:.1f}%</b> · 성북구 구글 리뷰 평점 <b>{avg_rating:.2f}점</b>을 "
+        f"종합한 최적 추천 업종입니다."
+    )
+    recommendation = (
+        f"🤖 [PyTorch 시계열·리뷰 통합 분석] {region_name} 추천 업종: "
+        f"{recommended_industry} (적합도 {ai_score}점)"
+    )
 
     nearby_stores = []
     for _, store in active_df.head(30).iterrows():
         nearby_stores.append({
-            "name": str(store['사업장명']),
-            "category": str(store['업태구분명']),
-            "lat": store['lat'],
-            "lng": store['lng']
+            "name": str(store["사업장명"]),
+            "category": str(store["업태구분명"]),
+            "lat": store["lat"],
+            "lng": store["lng"],
         })
 
     return {
@@ -213,11 +215,12 @@ def analyze_radius(lat: float, lng: float, radius_m: float = 300.0):
         "industry_reason": industry_reason,
         "estimated_score": ai_score,
         "recommendation": recommendation,
-        "nearby_stores": nearby_stores
+        "nearby_stores": nearby_stores,
     }
 
+
 # ---------------------------------------------------------
-# 4. API 엔드포인트 2: 업종별 최적 입지 추천 (신규 기능)
+# 4. API 엔드포인트 2: 업종별 최적 입지 추천 (기존 드롭다운 '까페' 등 100% 호환)
 # ---------------------------------------------------------
 @app.get("/api/industry-recommendation")
 def industry_recommendation(industry: str = "한식"):
@@ -225,48 +228,54 @@ def industry_recommendation(industry: str = "한식"):
     if df.empty:
         raise HTTPException(status_code=500, detail="데이터 로드 실패")
 
-    ind_df = df[df['업태구분명'] == industry]
-    if ind_df.empty:
-        return {"industry": industry, "recommendations": []}
-
-    dong_stats = ind_df.groupby('법정동')['상세영업상태명'].agg(
-        total='count',
-        active=lambda x: (x == '영업').sum()
+    ind_df = df[df["업태구분명"] == industry]
+    dong_stats = (
+        ind_df.groupby("법정동")["상세영업상태명"].agg(
+            total="count",
+            active=lambda x: (x == "영업").sum(),
+        )
+        if not ind_df.empty
+        else pd.DataFrame()
     )
-    dong_stats['survival_rate'] = dong_stats['active'] / dong_stats['total']
-    
-    # 최소 점포수 5개 이상인 동 중에서 생존율과 영업점포수가 높은 순으로 정렬
-    valid_dongs = dong_stats[dong_stats['total'] >= 5].sort_values(by=['survival_rate', 'active'], ascending=False).head(5)
 
-    recommendations = []
-    for dong, row in valid_dongs.iterrows():
-        coord = COORDINATES.get(dong, {"lat": 37.6033, "lng": 127.0242})
-        
-        # PyTorch 모델 활용 점수 산출
-        active_val = row['active'] / 200.0
-        closed_ratio = (row['total'] - row['active']) / row['total']
-        div = row['survival_rate']
-        inp = torch.tensor([[active_val, closed_ratio, div]], dtype=torch.float32)
-        with torch.no_grad():
-            score = round(ai_model(inp).item() * 100, 1)
+    rec = get_ai_recommender()
+    candidates = []
+    for dong, coord in COORDINATES.items():
+        pair = rec.get_pair_score(region=dong, category=industry)
+        if pair is None:
+            continue
 
-        recommendations.append({
+        if not dong_stats.empty and dong in dong_stats.index:
+            total_cnt = int(dong_stats.loc[dong, "total"])
+            active_cnt = int(dong_stats.loc[dong, "active"])
+            surv_rate = round((active_cnt / max(total_cnt, 1)) * 100, 1)
+        else:
+            total_cnt = 0
+            active_cnt = 0
+            surv_rate = pair["AI_예측_생존율_퍼센트"]
+
+        candidates.append({
             "district": dong,
             "lat": coord["lat"],
             "lng": coord["lng"],
-            "active_count": int(row['active']),
-            "total_count": int(row['total']),
-            "survival_rate": round(row['survival_rate'] * 100, 1),
-            "score": score
+            "active_count": active_cnt,
+            "total_count": total_cnt,
+            "survival_rate": surv_rate,
+            "score": pair["AI_상권적합도_점수"],
+            "pred_sales_10k": pair["AI_예측_차기분기_점포당매출_만원"],
         })
+
+    # 학습된 PyTorch AI 적합도 점수 높은 순 TOP 5 정렬
+    recommendations = sorted(candidates, key=lambda x: x["score"], reverse=True)[:5]
 
     return {
         "industry": industry,
-        "recommendations": recommendations
+        "recommendations": recommendations,
     }
 
+
 # ---------------------------------------------------------
-# 5. 프론트엔드 대시보드 (듀얼 모드: 반경 분석 + 업종별 입지 추천)
+# 5. 프론트엔드 대시보드 (기존 UI 100% 유지)
 # ---------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def read_root():
@@ -308,7 +317,7 @@ def read_root():
 
                 <!-- 모드 1: 반경 분석 -->
                 <div id="modeRadius" class="mode-content active">
-                    <p>지도를 클릭하여 반경 내 점포의 **영업 유지 기간 및 시계열 트렌드**를 분석하세요.</p>
+                    <p>지도를 클릭하여 반경 내 점포의 <b>영업 유지 기간 및 시계열 트렌드</b>를 분석하세요.</p>
                     <div class="radius-control">
                         <label><b>📏 분석 반경 설정: <span id="radiusVal" style="color:#e67e22;">300</span>m</b></label>
                         <input type="range" id="radiusInput" min="100" max="1000" step="50" value="300" oninput="updateRadius(this.value)">
@@ -318,7 +327,7 @@ def read_root():
 
                 <!-- 모드 2: 업종별 최적 입지 추천 -->
                 <div id="modeIndustry" class="mode-content">
-                    <p>창업하고 싶은 업종을 선택하면 **성북구 내 생존율이 가장 높은 최적의 법정동 TOP 5**를 추천합니다.</p>
+                    <p>창업하고 싶은 업종을 선택하면 <b>성북구 내 AI 상권 적합도가 가장 높은 법정동 TOP 5</b>를 추천합니다.</p>
                     <div class="industry-control">
                         <label><b>🍜 창업 희망 업종 선택</b></label>
                         <select id="industrySelect">
@@ -404,10 +413,8 @@ def read_root():
                 async function getAnalysis(lat, lng) {
                     const radius = document.getElementById('radiusInput').value;
                     const res = await fetch(`/api/radius-analysis?lat=${lat}&lng=${lng}&radius_m=${radius}`, {
-    headers: {
-        'ngrok-skip-browser-warning': '69420'
-    }
-});
+                        headers: { 'ngrok-skip-browser-warning': '69420' }
+                    });
                     const data = await res.json();
 
                     clearRadiusMarkers();
@@ -470,10 +477,8 @@ def read_root():
                 async function getIndustryRecommendation() {
                     const industry = document.getElementById('industrySelect').value;
                     const res = await fetch(`/api/industry-recommendation?industry=${encodeURIComponent(industry)}`, {
-    headers: {
-        'ngrok-skip-browser-warning': '69420'
-    }
-});
+                        headers: { 'ngrok-skip-browser-warning': '69420' }
+                    });
                     const data = await res.json();
 
                     clearIndMarkers();
@@ -488,13 +493,11 @@ def read_root():
                                 <td style="color:#2980b9;"><b>${rec.score}점</b></td>
                             </tr>`;
 
-                            // 지도에 순위 마커 표시
                             let m = L.marker([rec.lat, rec.lng]).addTo(map)
-                                .bindPopup(`<b>[${idx+1}위] 성북구 ${rec.district}</b><br>업종: ${industry}<br>생존율: ${rec.survival_rate}%<br>적합도: ${rec.score}점`);
+                                .bindPopup(`<b>[${idx+1}위] 성북구 ${rec.district}</b><br>업종: ${industry}<br>생존율: ${rec.survival_rate}%<br>AI 적합도: ${rec.score}점`);
                             indMarkers.push(m);
                         });
 
-                        // 첫 번째 추천 지역으로 지도 이동
                         map.setView([data.recommendations[0].lat, data.recommendations[0].lng], 14);
                     } else {
                         rows = `<tr><td colspan="4">해당 업종 데이터가 부족합니다.</td></tr>`;

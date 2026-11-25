@@ -12,10 +12,9 @@ Repository: https://github.com/hs-2191270-jeongseyoung/deep-bite
 2. [객관적 미래 검증]
    - 학습에 전혀 쓰지 않은 미래 시점(2026년 2분기) 서울시 전체(~3,600건) 및 성북구(161건) 실제 데이터로
      Validation R2, RMSE, MAE를 산출해 모델의 일반화 성능을 증명합니다.
-3. [양방향 추론 + 성북구 구글 리뷰 결합]
-   - 학습된 AI 모델로 성북구 12대 권역 x 9대 업종의 다음 분기 기대 매출·생존 점수를 예측(70%)하고,
-     성북구 구글 음식점 리뷰(2,261건)의 평점·감성·수요 보정 점수(30%)를 결합해 최종 적합도(0~100점) 산출.
-   - 기존 `ai_router.py` 및 FastAPI 백엔드 인터페이스 100% 호환 유지.
+3. [양방향 추론 + 성북구 구글 리뷰 결합 + 기존 main.py 100% 호환]
+   - 기존 main.py 드롭다운 업종명('까페', '중국식', '경양식', '호프/통닭', '통닭(치킨)', '분식', '일식', '한식')
+     및 법정동명('하월곡동' -> '월곡동') 자동 매핑 지원.
 """
 
 from __future__ import annotations
@@ -57,7 +56,6 @@ TS_NUMERIC_FEATURE_COLS: List[str] = [
     "분기_cos",
 ]
 
-# 성북구 추론 테이블 컬럼명과 시계열 학습 컬럼명 매핑
 SEONGBUK_COL_ALIAS: Dict[str, str] = {
     "개업_율": "공식_개업률",
     "폐업_률": "공식_폐업률",
@@ -67,6 +65,63 @@ OFFICIAL_FOOD_CATS: List[str] = [
     "한식음식점", "중식음식점", "일식음식점", "양식음식점", "제과점",
     "패스트푸드점", "치킨전문점", "분식전문점", "호프-간이주점", "커피-음료",
 ]
+
+# 기존 main.py 업태명 / 드롭다운 명칭 -> 표준 업종 1:1 매핑 사전
+INDUSTRY_ALIAS_MAP: Dict[str, str] = {
+    "한식": "한식",
+    "분식": "분식/면류",
+    "분식/면류": "분식/면류",
+    "호프/통닭": "주점/바",
+    "주점/바": "주점/바",
+    "주점": "주점/바",
+    "까페": "카페/디저트",
+    "카페": "카페/디저트",
+    "카페/디저트": "카페/디저트",
+    "커피숍": "카페/디저트",
+    "일식": "일식/돈까스/초밥",
+    "일식/돈까스/초밥": "일식/돈까스/초밥",
+    "중국식": "중식",
+    "중식": "중식",
+    "경양식": "양식/브런치",
+    "양식": "양식/브런치",
+    "양식/브런치": "양식/브런치",
+    "통닭(치킨)": "치킨/호프",
+    "치킨": "치킨/호프",
+    "치킨/호프": "치킨/호프",
+    "패스트푸드": "양식/브런치",
+    "아시안/해산물/기타": "아시안/해산물/기타",
+}
+
+# 기존 main.py 법정동명 -> 권역명 매핑
+REGION_ALIAS_MAP: Dict[str, str] = {
+    "하월곡동": "월곡동",
+    "상월곡동": "월곡동",
+    "동소문동": "동선동",
+}
+
+
+def resolve_category_name(category: str, available_categories: List[str]) -> str:
+    """기존 main.py의 '까페', '중국식', '경양식', '통닭(치킨)' 등을 표준 업종명으로 정확히 변환합니다."""
+    key = str(category).strip()
+    if key in INDUSTRY_ALIAS_MAP and INDUSTRY_ALIAS_MAP[key] in available_categories:
+        return INDUSTRY_ALIAS_MAP[key]
+    for c in available_categories:
+        if key in c or c in key:
+            return c
+    return "한식"
+
+
+def resolve_region_name(region: str, available_regions: List[str]) -> str:
+    """기존 main.py의 '하월곡동' 등을 모델 권역명('월곡동')으로 정확히 변환합니다."""
+    key = str(region).strip()
+    if key in REGION_ALIAS_MAP:
+        key = REGION_ALIAS_MAP[key]
+    if key in available_regions:
+        return key
+    for r in available_regions:
+        if key[:2] in r:
+            return r
+    return "동선동"
 
 
 if TORCH_AVAILABLE:
@@ -95,7 +150,7 @@ if TORCH_AVAILABLE:
                 nn.Linear(32, 16),
                 nn.ReLU(),
             )
-            self.head = nn.Linear(16, 2)  # [pred_sales_log_norm, pred_survival_norm]
+            self.head = nn.Linear(16, 2)
 
         def forward(self, cat_idx: "torch.Tensor", numeric_x: "torch.Tensor") -> "torch.Tensor":
             c_e = self.cat_emb(cat_idx)
@@ -160,7 +215,6 @@ def _predict_with_artifacts(
     norm_x: np.ndarray,
     artifacts: TrainingArtifacts,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """학습된 PyTorch 또는 NumPy 가중치로 (예측 점포당 매출 log, 예측 생존율)을 반환합니다."""
     if TORCH_AVAILABLE and artifacts.torch_model is not None:
         model = artifacts.torch_model
         model.eval()
@@ -190,10 +244,6 @@ def train_bidirectional_model(
     batch_size: int = 256,
     seed: int = 42,
 ) -> TrainingArtifacts:
-    """
-    서울시 전체 425개 행정동 시계열(Train: 2025Q1~2026Q1)로 실제 다음 분기 점포당 매출과 생존율을 학습하고,
-    2026년 2분기 실제 서울시·성북구 데이터로 검증한 뒤 가중치를 저장합니다.
-    """
     np.random.seed(seed)
     ts_path = _resolve_timeseries_path(features_csv_path, timeseries_csv_path)
     ts_df = pd.read_csv(ts_path)
@@ -273,7 +323,6 @@ def train_bidirectional_model(
             pt_path,
         )
     else:
-        # 미니배치 Adam 역전파 신경망 (PyTorch 미설치 환경 호환)
         c_oh = np.eye(len(OFFICIAL_FOOD_CATS), dtype=np.float32)[c_train]
         full_x = np.concatenate([c_oh, x_train], axis=1)
 
@@ -356,7 +405,6 @@ def train_bidirectional_model(
         torch_model=torch_model,
     )
 
-    # 미래 분기(2026Q2) 실제 데이터 검증
     seoul_pred_sales, _ = _predict_with_artifacts(c_val, x_val, temp_art)
     sb_pred_sales, sb_pred_surv = _predict_with_artifacts(c_sb_val, x_sb_val, temp_art)
 
@@ -389,9 +437,7 @@ def train_bidirectional_model(
 
 class DeepBiteRecommender:
     """
-    양방향 상권 적합도 추론 엔진
-    - AI 예측(서울시 18,000+ 시계열 학습 모델의 다음 분기 기대 점포당 매출·생존율) 70%
-    - 성북구 구글 리뷰(2,261건 평점·감성·수요 보정 점수) 30%
+    양방향 상권 적합도 추론 엔진 (기존 main.py 업종명 '까페', '중국식', '경양식', '통닭(치킨)' 등 100% 호환)
     """
 
     def __init__(self, features_csv_path: str, artifacts: TrainingArtifacts) -> None:
@@ -409,14 +455,12 @@ class DeepBiteRecommender:
         pred_sales_10k = np.expm1(np.clip(pred_sales_log, 0.0, 12.0))
         pred_survival = np.clip(pred_survival, 50.0, 100.0)
 
-        # AI 예측 기대 매출(0~100 정규화) + AI 예측 생존율(0~100 정규화)
         s_min, s_max = float(pred_sales_log.min()), float(pred_sales_log.max())
         sales_score = 45.0 + 50.0 * (pred_sales_log - s_min) / max(s_max - s_min, 1e-6)
         surv_score = np.clip((pred_survival - 88.0) / 12.0 * 100.0, 35.0, 98.0)
         ai_forecast_score = 0.72 * sales_score + 0.28 * surv_score
 
         review_score = self.df["구글리뷰_로컬점수"].values.astype(np.float32)
-        # 최종 적합도 = AI 미래 매출·생존 예측(70%) + 성북구 구글 리뷰 로컬 보정(30%)
         final_score = np.clip(0.70 * ai_forecast_score + 0.30 * review_score, 20.0, 98.0)
 
         self.df["AI_예측_차기분기_점포당매출_만원"] = np.round(pred_sales_10k, 1)
@@ -429,6 +473,23 @@ class DeepBiteRecommender:
         dists = (reg_coords["중심_위도"] - lat) ** 2 + (reg_coords["중심_경도"] - lng) ** 2
         return str(dists.idxmin())
 
+    def get_pair_score(self, region: str, category: str) -> Optional[Dict[str, object]]:
+        """특정 (권역, 업종) 쌍의 AI 예측 점수·매출·생존율·리뷰 평점을 조회합니다."""
+        resolved_reg = resolve_region_name(region, self.artifacts.regions)
+        resolved_cat = resolve_category_name(category, self.artifacts.categories)
+        sub = self.df[(self.df["권역"] == resolved_reg) & (self.df["표준업종"] == resolved_cat)]
+        if sub.empty:
+            return None
+        row = sub.iloc[0]
+        return {
+            "권역": resolved_reg,
+            "표준업종": resolved_cat,
+            "AI_상권적합도_점수": round(float(row["AI_예측_적합도"]), 1),
+            "AI_예측_차기분기_점포당매출_만원": round(float(row["AI_예측_차기분기_점포당매출_만원"]), 1),
+            "AI_예측_생존율_퍼센트": round(float(row["AI_예측_생존율_퍼센트"]), 1),
+            "평균_신뢰도평점": round(float(row["평균_신뢰도평점"]), 2),
+        }
+
     def recommend_categories_for_region(
         self,
         region: Optional[str] = None,
@@ -437,10 +498,11 @@ class DeepBiteRecommender:
         top_k: int = 5,
     ) -> List[Dict[str, object]]:
         """[방향 1: 지역 선택 -> 최적 업종 추천]"""
-        target_region = region
-        if not target_region and lat is not None and lng is not None:
+        if region:
+            target_region = resolve_region_name(region, self.artifacts.regions)
+        elif lat is not None and lng is not None:
             target_region = self.find_nearest_region(lat, lng)
-        if not target_region or target_region not in self.df["권역"].values:
+        else:
             target_region = "동선동"
 
         sub = self.df[self.df["권역"] == target_region].sort_values(
@@ -448,20 +510,24 @@ class DeepBiteRecommender:
         )
         results: List[Dict[str, object]] = []
         for rank, (_, row) in enumerate(sub.head(top_k).iterrows(), start=1):
+            score = round(float(row["AI_예측_적합도"]), 2)
+            sales = round(float(row["AI_예측_차기분기_점포당매출_만원"]), 1)
+            surv = round(float(row["AI_예측_생존율_퍼센트"]), 2)
+            rating = round(float(row["평균_신뢰도평점"]), 2)
             results.append({
                 "순위": rank,
                 "권역": row["권역"],
                 "추천_업종": row["표준업종"],
-                "AI_상권적합도_점수": float(row["AI_예측_적합도"]),
-                "AI_예측_차기분기_점포당매출_만원": float(row["AI_예측_차기분기_점포당매출_만원"]),
-                "AI_예측_생존율_퍼센트": float(row["AI_예측_생존율_퍼센트"]),
-                "구글리뷰_로컬점수": float(row["구글리뷰_로컬점수"]),
-                "공식_외식점포수": float(row["공식_외식점포수"]),
-                "평균_신뢰도평점": float(row["평균_신뢰도평점"]),
+                "AI_상권적합도_점수": score,
+                "AI_예측_차기분기_점포당매출_만원": sales,
+                "AI_예측_생존율_퍼센트": surv,
+                "구글리뷰_로컬점수": round(float(row["구글리뷰_로컬점수"]), 2),
+                "공식_외식점포수": round(float(row["공식_외식점포수"]), 1),
+                "평균_신뢰도평점": rating,
                 "추천_분석코멘트": (
                     f"{row['권역']} '{row['표준업종']}' 업종은 AI 예측 다음 분기 점포당 매출 "
-                    f"{row['AI_예측_차기분기_점포당매출_만원']:,.0f}만 원·생존율 {row['AI_예측_생존율_퍼센트']:.1f}%이며, "
-                    f"성북구 구글 리뷰 평점({row['평균_신뢰도평점']:.2f})을 반영한 종합 적합도가 우수합니다."
+                    f"{sales:,.0f}만 원·생존율 {surv:.1f}%이며, "
+                    f"성북구 구글 리뷰 평점({rating:.2f})을 반영한 종합 적합도가 우수합니다."
                 ),
             })
         return results
@@ -472,31 +538,32 @@ class DeepBiteRecommender:
         top_k: int = 5,
     ) -> List[Dict[str, object]]:
         """[방향 2: 업종 선택 -> 최적 지역 추천]"""
-        matched_cat = next(
-            (c for c in self.artifacts.categories if category in c or c in category),
-            "카페/디저트",
-        )
+        matched_cat = resolve_category_name(category, self.artifacts.categories)
         sub = self.df[self.df["표준업종"] == matched_cat].sort_values(
             by="AI_예측_적합도", ascending=False
         )
         results: List[Dict[str, object]] = []
         for rank, (_, row) in enumerate(sub.head(top_k).iterrows(), start=1):
+            score = round(float(row["AI_예측_적합도"]), 2)
+            sales = round(float(row["AI_예측_차기분기_점포당매출_만원"]), 1)
+            surv = round(float(row["AI_예측_생존율_퍼센트"]), 2)
+            rating = round(float(row["평균_신뢰도평점"]), 2)
             results.append({
                 "순위": rank,
                 "희망_업종": matched_cat,
                 "추천_권역": row["권역"],
-                "AI_상권적합도_점수": float(row["AI_예측_적합도"]),
-                "중심_위도": float(row["중심_위도"]),
-                "중심_경도": float(row["중심_경도"]),
-                "AI_예측_차기분기_점포당매출_만원": float(row["AI_예측_차기분기_점포당매출_만원"]),
-                "AI_예측_생존율_퍼센트": float(row["AI_예측_생존율_퍼센트"]),
+                "AI_상권적합도_점수": score,
+                "중심_위도": round(float(row["중심_위도"]), 6),
+                "중심_경도": round(float(row["중심_경도"]), 6),
+                "AI_예측_차기분기_점포당매출_만원": sales,
+                "AI_예측_생존율_퍼센트": surv,
                 "총_유동인구": int(row["총_유동인구"]),
-                "구글리뷰_로컬점수": float(row["구글리뷰_로컬점수"]),
-                "평균_신뢰도평점": float(row["평균_신뢰도평점"]),
+                "구글리뷰_로컬점수": round(float(row["구글리뷰_로컬점수"]), 2),
+                "평균_신뢰도평점": rating,
                 "추천_분석코멘트": (
                     f"'{matched_cat}' 창업 시 {row['권역']}(AI 예측 점포당 매출 "
-                    f"{row['AI_예측_차기분기_점포당매출_만원']:,.0f}만 원, 예측 생존율 {row['AI_예측_생존율_퍼센트']:.1f}%, "
-                    f"리뷰 평점 {row['평균_신뢰도평점']:.2f})이 기대 수익성과 안정성 면에서 가장 유리합니다."
+                    f"{sales:,.0f}만 원, 예측 생존율 {surv:.1f}%, "
+                    f"리뷰 평점 {rating:.2f})이 기대 수익성과 안정성 면에서 가장 유리합니다."
                 ),
             })
         return results
@@ -520,16 +587,7 @@ if __name__ == "__main__":
 
     recommender = DeepBiteRecommender(features_csv_path=features_csv, artifacts=artifacts)
 
-    print("\n=== [방향 1 테스트] 지역 선택(안암동) -> 최적 창업 업종 TOP 3 ===")
-    for item in recommender.recommend_categories_for_region(region="안암동", top_k=3):
-        print(
-            f"  {item['순위']}위: {item['추천_업종']} "
-            f"(적합도 {item['AI_상권적합도_점수']}점 | 예측 매출 {item['AI_예측_차기분기_점포당매출_만원']:,.0f}만원 | 예측 생존율 {item['AI_예측_생존율_퍼센트']}%)"
-        )
-
-    print("\n=== [방향 2 테스트] 업종 선택(카페/디저트) -> 성북구 최적 창업 지역 TOP 3 ===")
-    for item in recommender.recommend_regions_for_category(category="카페/디저트", top_k=3):
-        print(
-            f"  {item['순위']}위: {item['추천_권역']} "
-            f"(적합도 {item['AI_상권적합도_점수']}점 | 예측 매출 {item['AI_예측_차기분기_점포당매출_만원']:,.0f}만원 | 리뷰 평점 {item['평균_신뢰도평점']})"
-        )
+    print("\n=== [기존 main.py 드롭다운 8개 업종 호환 테스트] ===")
+    for old_cat in ["한식", "분식", "호프/통닭", "까페", "일식", "중국식", "경양식", "통닭(치킨)"]:
+        top1 = recommender.recommend_regions_for_category(category=old_cat, top_k=1)[0]
+        print(f"  입력 '{old_cat}' -> 매핑 '{top1['희망_업종']}' | 1위 {top1['추천_권역']} ({top1['AI_상권적합도_점수']}점)")
